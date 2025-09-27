@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conditional DDPM Image Generation (MNIST)</title>
+    <!-- Load Inter font (using Google Fonts link is assumed for static site) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css"> <!-- Link to external CSS -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1 class="title">DDPM Conditional Image Generator</h1>
+        <p class="subtitle">Generate a synthetic handwritten digit by running the reverse diffusion process.</p>
+
+        <div class="space-y-6">
+            <!-- Controls -->
+            <div class="controls-container">
+                <div class="select-container">
+                    <label for="digitSelect">Target Digit (Condition):</label>
+                    <select id="digitSelect">
+                        <!-- Options populated by JS -->
+                    </select>
+                </div>
+                <!-- Diffusion Steps Dropdown -->
+                <div class="select-container">
+                    <label for="stepsSelect">Diffusion Steps (T):</label>
+                    <select id="stepsSelect">
+                        <!-- Options populated by JS -->
+                    </select>
+                </div>
+                <button id="generateBtn" class="btn primary">
+                    Generate Image
+                </button>
+            </div>
+
+            <!-- Loading Indicator -->
+            <div id="loading" class="loading-indicator">
+                <svg class="loading-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span id="loadingText">Denoising Image (50 steps)...</span>
+            </div>
+
+            <!-- Image display section -->
+            <div class="image-grid">
+                <div class="image-container">
+                    <span class="image-title">Initial Noise</span>
+                    <canvas id="noiseCanvas" class="canvas-box"></canvas>
+                </div>
+                <div class="image-container">
+                    <span class="image-title">Generated Image</span>
+                    <canvas id="outputCanvas" class="canvas-box"></canvas>
+                </div>
+            </div>
+
+            <!-- Result (for display of time taken) -->
+            <div id="resultBox" class="result-box">
+                <div class="flex justify-center items-center gap-2">
+                    <span class="result-text">Generation Complete in:</span>
+                    <span id="timeResult" class="result-value"></span>
+                    <span class="result-text">seconds</span>
+                </div>
+            </div>
+
+            <!-- Error Box -->
+            <div id="errorBox" class="error-box">
+                <span class="error-text">Error: </span>
+                <span id="errorMessage" class="error-message"></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        const IMAGE_SIZE = 32;
+        // Updated model path based on user's input
+        const ONNX_MODEL_PATH = 'digits_500_epochs.onnx'; 
+        
+        // Beta schedule constants (linear schedule, common for DDPM)
+        const BETA_START = 0.0001;
+        const BETA_END = 0.02;
+
+        // --- DOM Elements ---
+        const generateBtn = document.getElementById('generateBtn');
+        const digitSelect = document.getElementById('digitSelect');
+        const loadingDiv = document.getElementById('loading');
+        const loadingTextSpan = document.getElementById('loadingText'); // Span for dynamic step count
+        const resultBox = document.getElementById('resultBox');
+        const timeResultSpan = document.getElementById('timeResult');
+        const errorBox = document.getElementById('errorBox');
+        const errorMessageSpan = document.getElementById('errorMessage');
+        const noiseCanvas = document.getElementById('noiseCanvas');
+        const outputCanvas = document.getElementById('outputCanvas');
+        const stepsSelect = document.getElementById('stepsSelect'); 
+        
+        let ortSession = null;
+        let scheduler = null;
+        let numSteps = 50; // State variable for current steps
+
+        // Set up canvas contexts
+        const noiseCtx = noiseCanvas.getContext('2d');
+        noiseCanvas.width = IMAGE_SIZE;
+        noiseCanvas.height = IMAGE_SIZE;
+
+        const outputCtx = outputCanvas.getContext('2d');
+        outputCanvas.width = IMAGE_SIZE;
+        outputCanvas.height = IMAGE_SIZE;
+
+        // --- Utility Functions ---
+
+        /**
+         * Yields execution back to the browser's event loop to allow UI updates.
+         * @returns {Promise<void>}
+         */
+        function yieldToBrowser() {
+            return new Promise(resolve => setTimeout(resolve, 1));
+        }
+
+        /**
+         * Hides all status messages (loading, result, error).
+         */
+        function hideAllStatus() {
+            loadingDiv.classList.remove('visible');
+            resultBox.classList.remove('visible');
+            errorBox.classList.remove('visible');
+        }
+        
+        /**
+         * Displays an error message.
+         * @param {string} message 
+         */
+        function showError(message) {
+            hideAllStatus();
+            errorMessageSpan.textContent = message;
+            errorBox.classList.add('visible');
+            console.error(message);
+        }
+
+        /**
+         * Draws a 32x32 1-channel image tensor data onto a canvas.
+         * Assumes data is scaled between -1 and 1 (standard for DDPM training).
+         * @param {CanvasRenderingContext2D} ctx 
+         * @param {Float32Array} imagePixels 
+         */
+        function drawImage(ctx, imagePixels) {
+            const imageData = ctx.createImageData(IMAGE_SIZE, IMAGE_SIZE);
+            
+            // Clear canvas to black
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, IMAGE_SIZE, IMAGE_SIZE);
+
+            for (let i = 0; i < imagePixels.length; i++) {
+                const rawValue = imagePixels[i];
+                
+                // 1. Clamp the value to the expected range [-1, 1]
+                const clampedValue = Math.max(-1.0, Math.min(1.0, rawValue));
+                
+                // 2. Rescale from [-1, 1] to [0, 255]
+                const value = Math.round(((clampedValue + 1) / 2) * 255);
+                
+                // Set R, G, B, A for the pixel
+                const dataIndex = i * 4;
+                imageData.data[dataIndex] = value;     // Red
+                imageData.data[dataIndex + 1] = value; // Green
+                imageData.data[dataIndex + 2] = value; // Blue
+                imageData.data[dataIndex + 3] = 255;   // Alpha (Opaque)
+            }
+            ctx.putImageData(imageData, 0, 0);
+        }
+
+        /**
+         * Generates a 32x32 tensor of standard Gaussian noise.
+         * @returns {Float32Array}
+         */
+        function generateNoiseTensor() {
+            // Box-Muller Transform for standard normal distribution (Z ~ N(0, 1))
+            const size = IMAGE_SIZE * IMAGE_SIZE;
+            const noise = new Float32Array(size);
+            for (let i = 0; i < size; i += 2) {
+                let u = 0, v = 0;
+                while (u === 0) u = Math.random(); 
+                while (v === 0) v = Math.random();
+                const mag = Math.sqrt(-2.0 * Math.log(u));
+                noise[i] = mag * Math.cos(2.0 * Math.PI * v);
+                if (i + 1 < size) {
+                    noise[i + 1] = mag * Math.sin(2.0 * Math.PI * v);
+                }
+            }
+            // DDPM uses range [-1, 1] for data, so noise is standard N(0, 1)
+            return noise;
+        }
+
+        // --- DDPM Scheduler Initialization ---
+
+        /**
+         * Initializes DDPM scheduler constants (Betas, Alphas, etc.).
+         * @param {number} steps - The number of diffusion steps.
+         */
+        function initializeScheduler(steps, betaStart, betaEnd) {
+            const betas = new Float32Array(steps);
+            const alphas = new Float32Array(steps);
+            const alphaBars = new Float32Array(steps);
+            const posteriorVariance = new Float32Array(steps);
+
+            let alphaBarProduct = 1.0;
+
+            for (let t = 0; t < steps; t++) {
+                // 1. Calculate Beta (Linear Schedule)
+                const betaT = betaStart + (betaEnd - betaStart) * (t / (steps - 1));
+                betas[t] = betaT;
+
+                // 2. Calculate Alpha
+                const alphaT = 1.0 - betaT;
+                alphas[t] = alphaT;
+
+                // 3. Calculate Alpha Bar (Cumulative Alpha)
+                alphaBarProduct *= alphaT;
+                alphaBars[t] = alphaBarProduct;
+
+                // 4. Calculate Posterior Variance (Tilde Beta)
+                const alphaBarPrev = (t === 0) ? 1.0 : alphaBars[t - 1];
+                
+                // The DDPM posterior variance:
+                // \tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t} \beta_t
+                const alphaBarT = alphaBars[t];
+                const tildeBeta = (1.0 - alphaBarPrev) / (1.0 - alphaBarT) * betaT;
+                posteriorVariance[t] = tildeBeta;
+            }
+
+            return { betas, alphas, alphaBars, posteriorVariance };
+        }
+
+        /**
+         * Updates the global number of steps and re-initializes the scheduler.
+         * @param {number} steps - The new number of diffusion steps.
+         */
+        function setupScheduler(steps) {
+            numSteps = steps;
+            scheduler = initializeScheduler(steps, BETA_START, BETA_END);
+            // Update loading text
+            loadingTextSpan.textContent = `Denoising Image (${numSteps} steps)...`;
+        }
+
+
+        // --- Main DDPM Inference Logic (Reverse Loop) ---
+
+        /**
+         * Runs the DDPM reverse process step-by-step.
+         * @param {number} label - The conditional label (digit 0-9).
+         */
+        async function generateImage(label) {
+            if (!ortSession || !scheduler) {
+                showError("Model not initialized. Please wait for setup or check model path.");
+                return;
+            }
+
+            hideAllStatus();
+            loadingDiv.classList.add('visible');
+            generateBtn.disabled = true;
+            const startTime = performance.now();
+
+            try {
+                // 1. Start with initial noise
+                let imagePixels = generateNoiseTensor();
+                const initialNoise = imagePixels.slice(); 
+                drawImage(noiseCtx, initialNoise);
+
+                // 2. Prepare conditioning tensor (label) - using int64 for label
+                const labelTensor = new ort.Tensor('int64', new BigInt64Array([BigInt(label)]), [1]);
+                
+                // 3. Reverse Diffusion Loop (T down to 1)
+                for (let t = numSteps - 1; t >= 0; t--) {
+                    // Create time step tensor - using int64 for time step
+                    const timeTensor = new ort.Tensor('int64', new BigInt64Array([BigInt(t)]), [1]);
+                    
+                    // Create noisy image tensor (x_t)
+                    const noisyImageTensor = new ort.Tensor('float32', imagePixels, [1, 1, IMAGE_SIZE, IMAGE_SIZE]);
+
+                    // --- A. Predict the Noise (U-Net Forward Pass) ---
+                    const feeds = {
+                        // Using 'image' and 'time_step' based on the user's provided file
+                        'image': noisyImageTensor,
+                        'time_step': timeTensor,
+                        'label': labelTensor
+                    };
+                    
+                    const results = await ortSession.run(feeds);
+                    // Using 'clean_image' output key based on the user's provided file
+                    const predictedNoisePixels = results.clean_image.cpuData; 
+
+                    // --- B. Extract Scheduler Constants ---
+                    const betaT = scheduler.betas[t];
+                    const alphaT = scheduler.alphas[t];
+                    const alphaBarT = scheduler.alphaBars[t];
+
+                    // --- C. Calculate the New Mean (mu_theta) ---
+                    // mu_theta = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * epsilon_theta)
+                    const sqrtAlphaT = Math.sqrt(alphaT);
+                    const meanCoeff1 = 1.0 / sqrtAlphaT;
+                    const meanCoeff2 = betaT / Math.sqrt(1.0 - alphaBarT);
+
+                    const newImagePixels = new Float32Array(imagePixels.length);
+
+                    for (let i = 0; i < imagePixels.length; i++) {
+                        // Standard DDPM mean calculation (assuming model output is predicted noise epsilon)
+                        const mean = meanCoeff1 * (imagePixels[i] - meanCoeff2 * predictedNoisePixels[i]);
+                        newImagePixels[i] = mean;
+                    }
+                    
+                    // --- D. Sample the Next Image (x_{t-1}) ---
+                    if (t > 0) {
+                        // x_{t-1} = mu_theta + sqrt(tilde_beta_t) * z
+                        const variance = scheduler.posteriorVariance[t];
+                        const sqrtVariance = Math.sqrt(variance);
+                        const z = generateNoiseTensor(); // New Gaussian noise z ~ N(0, 1)
+
+                        for (let i = 0; i < imagePixels.length; i++) {
+                            newImagePixels[i] = newImagePixels[i] + sqrtVariance * z[i];
+                        }
+                    }
+                    
+                    // Update image state for the next step (x_{t-1})
+                    imagePixels = newImagePixels;
+
+                    // Intermediate Drawing: Draw every 5 steps for a dynamic preview
+                    if (t > 0 && t % 5 === 0) { 
+                        drawImage(outputCtx, imagePixels); 
+                        // Yield control to the browser to render the canvas update
+                        await yieldToBrowser();
+                    }
+                }
+
+                // Final image (x_0)
+                drawImage(outputCtx, imagePixels);
+                
+                const endTime = performance.now();
+                const timeTaken = ((endTime - startTime) / 1000).toFixed(2);
+                timeResultSpan.textContent = timeTaken;
+                resultBox.classList.add('visible');
+
+            } catch (e) {
+                showError("Error during inference: " + (e.message || "Unknown error. Check console."));
+                console.error("Full Inference Error:", e);
+            } finally {
+                loadingDiv.classList.remove('visible');
+                generateBtn.disabled = false;
+            }
+        }
+
+        // --- Initialization and Event Setup ---
+
+        /**
+         * Populates the dropdowns and initializes the model.
+         */
+        async function initializeApp() {
+            // 1. Populate Digit Dropdown (Digits 0-9)
+            for (let i = 0; i <= 9; i++) {
+                const option = document.createElement('option');
+                option.value = i;
+                option.textContent = i;
+                digitSelect.appendChild(option);
+            }
+
+            // 2. Populate Steps Dropdown and Initialize Scheduler
+            const stepOptions = [25, 50, 100, 200, 500, 1000]; // Added 500 and 1000 for flexibility
+            stepOptions.forEach(steps => {
+                const option = document.createElement('option');
+                option.value = steps;
+                option.textContent = steps;
+                stepsSelect.appendChild(option);
+            });
+
+            // Set default value and initial state
+            stepsSelect.value = 50; 
+            setupScheduler(50); // Set initial steps and scheduler
+
+            // 3. Initialize ORT Session
+            try {
+                // Loading the user-specified ONNX model
+                ortSession = await ort.InferenceSession.create(ONNX_MODEL_PATH);
+                console.log("ONNX Model loaded successfully.");
+            } catch (e) {
+                showError(`Failed to load ONNX model at '${ONNX_MODEL_PATH}'. Please ensure the file is present and correct.`);
+                console.error("ONNX Load Error:", e);
+            }
+            
+            // 4. Set initial canvas state (pure noise)
+            drawImage(noiseCtx, generateNoiseTensor());
+            
+            // 5. Attach Event Listeners
+            stepsSelect.addEventListener('change', (e) => {
+                const newSteps = parseInt(e.target.value, 10);
+                setupScheduler(newSteps);
+            });
+
+            generateBtn.addEventListener('click', () => {
+                const selectedLabel = parseInt(digitSelect.value, 10);
+                generateImage(selectedLabel);
+            });
+        }
+
+        initializeApp();
+
+    </script>
+</body>
+</html>
