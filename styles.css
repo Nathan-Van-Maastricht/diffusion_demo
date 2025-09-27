@@ -1,5 +1,3 @@
-/* DDPM App Styles: Extracted from original HTML */
-
 body {
     font-family: 'Inter', sans-serif;
     background-color: #f3f4f6;
@@ -8,7 +6,7 @@ body {
     align-items: center;
     justify-content: center;
     padding: 1rem;
-    min-height: 100vh;
+    /* min-height: 100vh; */
 }
 
 @media (min-width: 640px) {
